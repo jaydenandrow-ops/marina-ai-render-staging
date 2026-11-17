@@ -121,11 +121,17 @@ def validate_runtime_environment(env: dict[str, str] | None = None, *, announce:
             "Remove the initialization confirmation when staging initialization is disabled.")
     passed("staging_initialization_authorization")
 
-    for name in ("GENESIS_ALLOWED_HOSTS", "GENESIS_CANONICAL_ORIGIN", "GENESIS_CORS_ALLOWED_ORIGINS",
-                 "GENESIS_TRUSTED_PROXY_CIDRS"):
+    for name in ("GENESIS_ALLOWED_HOSTS", "GENESIS_CANONICAL_ORIGIN", "GENESIS_CORS_ALLOWED_ORIGINS"):
         if not values.get(name, "").strip():
             raise DeploymentConfigError("required_network_configuration", name,
                 f"{name} must be explicitly configured.")
+
+    if values.get("GENESIS_RENDER_IGNORE_FORWARDED_HEADERS") != "1":
+        raise DeploymentConfigError("render_proxy_policy", "GENESIS_RENDER_IGNORE_FORWARDED_HEADERS",
+            "Render staging must explicitly ignore all forwarded headers.")
+    if values.get("GENESIS_TRUSTED_PROXY_CIDRS", "").strip():
+        raise DeploymentConfigError("render_proxy_policy", "GENESIS_TRUSTED_PROXY_CIDRS",
+            "Render staging must not configure unverified trusted proxy networks.")
 
     allowed_hosts = tuple(part.strip().lower() for part in values["GENESIS_ALLOWED_HOSTS"].split(",") if part.strip())
     if not allowed_hosts or any("*" in host for host in allowed_hosts):
@@ -154,16 +160,7 @@ def validate_runtime_environment(env: dict[str, str] | None = None, *, announce:
             "GENESIS_CORS_ALLOWED_ORIGINS must match GENESIS_CANONICAL_ORIGIN exactly.")
     passed("network_origin_and_host_policy")
 
-    cidrs = [part.strip() for part in values["GENESIS_TRUSTED_PROXY_CIDRS"].split(",") if part.strip()]
-    try:
-        networks = [ipaddress.ip_network(value, strict=False) for value in cidrs]
-    except ValueError:
-        raise DeploymentConfigError("trusted_proxy_cidrs", "GENESIS_TRUSTED_PROXY_CIDRS",
-            "GENESIS_TRUSTED_PROXY_CIDRS contains an invalid CIDR.") from None
-    if not networks or any(network.prefixlen == 0 for network in networks):
-        raise DeploymentConfigError("trusted_proxy_cidrs", "GENESIS_TRUSTED_PROXY_CIDRS",
-            "Trusted proxy CIDRs must be explicit; catch-all ranges are forbidden.")
-    passed("trusted_proxy_cidrs")
+    passed("render_proxy_policy")
 
     for name in ("CLOUD_ABUSE_HMAC_SECRET", "SECURITY_EVENT_HMAC_SECRET", "EMAIL_AUTH_THROTTLE_SECRET"):
         if len(values.get(name, "").encode("utf-8")) < 32:
@@ -326,7 +323,7 @@ def main() -> None:
     print("render_startup check=application_handoff status=starting server=uvicorn", flush=True)
     try:
         os.execv(sys.executable, [sys.executable, "-m", "uvicorn", "staging_app:app",
-            "--host", "0.0.0.0", "--port", str(port), "--workers", "1"])
+            "--host", "0.0.0.0", "--port", str(port), "--workers", "1", "--no-proxy-headers"])
     except OSError as exc:
         print(f"render_startup check=application_handoff status=fail error_class={type(exc).__name__}",
             file=sys.stderr, flush=True)

@@ -33,6 +33,8 @@ from database_safety import validate_test_database_configuration, validate_test_
 from database_backend import (checkout_postgres, close_postgres_pool, database_url, is_postgres_url,
     postgres_connection, validate_production_postgres_url, validate_render_internal_staging_postgres_url,
     validate_render_staging_libpq_environment, validate_test_postgres_url)
+from proxy_policy import (StagingHostError, render_staging_request_context,
+    render_staging_scope_is_https)
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("GENESIS_DB_PATH", str(ROOT / "genesis.db")))
@@ -106,6 +108,16 @@ if CANONICAL_ORIGIN and (_origin_parts.scheme not in {"http", "https"} or not _o
         or _origin_parts.username or _origin_parts.password):
     raise RuntimeError("GENESIS_CANONICAL_ORIGIN must be an absolute HTTP(S) origin without credentials or path.")
 _proxy_values = [x.strip() for x in os.getenv("GENESIS_TRUSTED_PROXY_CIDRS", "").split(",") if x.strip()]
+_render_ignore_forwarded = os.getenv("GENESIS_RENDER_IGNORE_FORWARDED_HEADERS", "0").strip()
+if _render_ignore_forwarded not in {"0", "1"}:
+    raise RuntimeError("GENESIS_RENDER_IGNORE_FORWARDED_HEADERS must be 0 or 1.")
+if _render_staging_mode == "1":
+    if _render_ignore_forwarded != "1" or _proxy_values:
+        raise RuntimeError("Render staging must ignore forwarded headers and configure no trusted proxy CIDRs.")
+elif _render_ignore_forwarded == "1":
+    raise RuntimeError("Ignoring forwarded headers is restricted to explicit Render staging.")
+elif GENESIS_ENV == "production" and not _proxy_values:
+    raise RuntimeError("GENESIS_TRUSTED_PROXY_CIDRS is required for non-staging production.")
 try:
     TRUSTED_PROXY_NETWORKS = tuple(ipaddress.ip_network(value, strict=False) for value in _proxy_values)
 except ValueError as exc:
@@ -631,9 +643,11 @@ class RawBodySizeLimitMiddleware:
         if declared:
             try:
                 if int(declared) > limit:
-                    return await self._too_large(send, secure=scope.get("scheme") == "https")
+                    return await self._too_large(send, secure=render_staging_scope_is_https(
+                        scope.get("scheme", "http"), _render_staging_mode == "1", CANONICAL_ORIGIN))
             except ValueError:
-                await send({"type": "http.response.start", "status": 400, "headers": self._error_headers(secure=scope.get("scheme") == "https")})
+                await send({"type": "http.response.start", "status": 400, "headers": self._error_headers(secure=render_staging_scope_is_https(
+                    scope.get("scheme", "http"), _render_staging_mode == "1", CANONICAL_ORIGIN))})
                 await send({"type": "http.response.body", "body": b'{"detail":"Invalid Content-Length."}'})
                 return
         messages, total = [], 0
@@ -644,7 +658,8 @@ class RawBodySizeLimitMiddleware:
             if message["type"] == "http.request":
                 total += len(message.get("body", b""))
                 if total > limit:
-                    return await self._too_large(send, secure=scope.get("scheme") == "https")
+                    return await self._too_large(send, secure=render_staging_scope_is_https(
+                        scope.get("scheme", "http"), _render_staging_mode == "1", CANONICAL_ORIGIN))
                 messages.append(message)
                 if not message.get("more_body", False):
                     break
@@ -704,9 +719,20 @@ async def bind_session_identity(request: Request, call_next):
             return _security_error(request, "Client network address is unavailable.", 403)
     forwarded_names = ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port")
     forwarded_present = any(request.headers.get(name) is not None for name in forwarded_names)
-    public_host, public_scheme = host_header, request.url.scheme.lower()
-    client_ip = peer_ip
-    if forwarded_present:
+    render_context = None
+    if _render_staging_mode == "1":
+        try:
+            render_context = render_staging_request_context(peer_ip, host_header, CANONICAL_ORIGIN,
+                {name: request.headers.get(name) for name in forwarded_names})
+        except StagingHostError:
+            security_event("host_rejected", ip=peer_ip)
+            return _security_error(request, "Request host is not allowed.", 400, scheme="https")
+        public_host, public_scheme, client_ip = (render_context.public_host,
+            render_context.public_scheme, render_context.client_ip)
+    else:
+        public_host, public_scheme = host_header, request.url.scheme.lower()
+        client_ip = peer_ip
+    if forwarded_present and _render_staging_mode != "1":
         if request.headers.get("forwarded") is not None or not _trusted_proxy(peer_ip):
             security_event("untrusted_forwarded_headers", ip=peer_ip)
             return _security_error(request, "Forwarded headers are not accepted from this peer.", 400)
@@ -736,7 +762,8 @@ async def bind_session_identity(request: Request, call_next):
                 security_event("forwarded_client_ip_rejected", ip=peer_ip)
                 return _security_error(request, "Forwarded client address is invalid.", 400)
     request.state.client_ip = client_ip
-    public_origin = f"{public_scheme}://{public_host}".rstrip("/")
+    public_origin = (render_context.public_origin if render_context is not None
+        else f"{public_scheme}://{public_host}".rstrip("/"))
     if CANONICAL_ORIGIN and not hmac.compare_digest(public_origin.lower(), CANONICAL_ORIGIN.lower()):
         security_event("canonical_origin_mismatch", ip=client_ip)
         return _security_error(request, "Request origin is not canonical.", 400, scheme=public_scheme)

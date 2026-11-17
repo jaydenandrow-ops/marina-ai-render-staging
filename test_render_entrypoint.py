@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 import render_entrypoint as entrypoint_module
 from database_backend import validate_production_postgres_url, validate_render_internal_staging_postgres_url
+from proxy_policy import (StagingHostError, render_staging_request_context,
+    render_staging_scope_is_https)
 from render_entrypoint import (DeploymentConfigError, StagingInitializationError,
     initialize_staging_database, validate_runtime_environment, verify_render_database_identity)
 
@@ -20,6 +22,7 @@ def valid_environment(ca_file: Path) -> dict[str, str]:
         "GENESIS_BIND_HOST": "0.0.0.0",
         "PORT": "10000",
         "GENESIS_RENDER_STAGING": "1",
+        "GENESIS_RENDER_IGNORE_FORWARDED_HEADERS": "1",
         "GENESIS_DATABASE_URL": "postgresql://marina_staging:placeholder@db.internal/marina_staging?sslmode=require",
         "GENESIS_RENDER_DATABASE_HOST": "db.internal",
         "GENESIS_RENDER_DATABASE_NAME": "marina_staging",
@@ -28,7 +31,6 @@ def valid_environment(ca_file: Path) -> dict[str, str]:
         "GENESIS_ALLOWED_HOSTS": "staging.example.test",
         "GENESIS_CANONICAL_ORIGIN": "https://staging.example.test",
         "GENESIS_CORS_ALLOWED_ORIGINS": "https://staging.example.test",
-        "GENESIS_TRUSTED_PROXY_CIDRS": "10.23.0.0/16",
         "CLOUD_ABUSE_HMAC_SECRET": "a" * 32,
         "SECURITY_EVENT_HMAC_SECRET": "b" * 32,
         "EMAIL_AUTH_THROTTLE_SECRET": "c" * 32,
@@ -63,10 +65,10 @@ class RenderEntrypointTests(unittest.TestCase):
             ("GENESIS_BIND_HOST", "bind_host"),
             ("PORT", "assigned_port"),
             ("GENESIS_RENDER_STAGING", "render_staging_scope"),
+            ("GENESIS_RENDER_IGNORE_FORWARDED_HEADERS", "render_proxy_policy"),
             ("GENESIS_DATABASE_URL", "database_backend"),
                 ("GENESIS_RENDER_DATABASE_HOST", "database_target"),
             ("GENESIS_RENDER_DATABASE_USER", "database_target"),
-            ("GENESIS_TRUSTED_PROXY_CIDRS", "required_network_configuration"),
             ("CLOUD_ABUSE_HMAC_SECRET", "required_secret"),
             ("STAGING_BASIC_AUTH_PASSWORD", "staging_basic_auth"),
         )
@@ -97,7 +99,7 @@ class RenderEntrypointTests(unittest.TestCase):
             ("GENESIS_CANONICAL_ORIGIN", "https://[malformed", "canonical_https_origin"),
             ("GENESIS_ALLOWED_HOSTS", "staging.example.test,*", "trusted_hosts"),
             ("GENESIS_CORS_ALLOWED_ORIGINS", "https://other.invalid", "same_origin_cors"),
-            ("GENESIS_TRUSTED_PROXY_CIDRS", "0.0.0.0/0", "trusted_proxy_cidrs"),
+            ("GENESIS_TRUSTED_PROXY_CIDRS", "10.23.0.0/16", "render_proxy_policy"),
             ("IMAGE_GENERATION_ENABLED", "sometimes", "disabled_feature_flag"),
             ("IMAGE_GENERATION_ENABLED", "1", "disabled_feature_flag"),
         )
@@ -232,6 +234,47 @@ class RenderEntrypointTests(unittest.TestCase):
             with self.assertRaises(HandoffReached):
                 entrypoint_module.main()
         identity_check.assert_called_once_with()
+
+    def test_startup_disables_uvicorn_proxy_header_processing(self):
+        class HandoffReached(Exception):
+            pass
+
+        with patch.object(entrypoint_module, "validate_runtime_environment", return_value=10000), \
+                patch.object(entrypoint_module, "initialize_staging_database", return_value="disabled"), \
+                patch.object(entrypoint_module, "verify_render_database_identity"), \
+                patch.object(entrypoint_module.os, "execv", side_effect=HandoffReached) as execv:
+            with self.assertRaises(HandoffReached):
+                entrypoint_module.main()
+        args = execv.call_args.args[1]
+        self.assertIn("--no-proxy-headers", args)
+
+    def test_render_proxy_spoof_headers_are_ignored_and_rate_limit_uses_peer(self):
+        peer = "10.42.7.9"
+        attempts = (
+            {"x-forwarded-for": "198.51.100.80", "x-forwarded-proto": "http",
+             "x-forwarded-host": "attacker.invalid"},
+            {"x-forwarded-for": "127.0.0.1", "x-forwarded-proto": "https",
+             "x-forwarded-host": "staging.example.test"},
+            {"forwarded": "for=127.0.0.1;proto=http;host=attacker.invalid"},
+        )
+        for headers in attempts:
+            with self.subTest(headers=tuple(headers)):
+                context = render_staging_request_context(peer, "staging.example.test",
+                    "https://staging.example.test", headers)
+                self.assertEqual(context.public_origin, "https://staging.example.test")
+                self.assertEqual(context.public_scheme, "https")
+                self.assertEqual(context.client_ip, peer)
+                # Downstream per-IP admission/rate limiting receives this value.
+                rate_limit_identity = context.client_ip
+                self.assertEqual(rate_limit_identity, peer)
+
+    def test_render_proxy_context_rejects_host_spoof_and_uses_https_for_security(self):
+        with self.assertRaises(StagingHostError):
+            render_staging_request_context("10.42.7.9", "attacker.invalid",
+                "https://staging.example.test", {"x-forwarded-host": "staging.example.test"})
+        self.assertTrue(render_staging_scope_is_https("http", True, "https://staging.example.test"))
+        self.assertFalse(render_staging_scope_is_https("http", False, "https://staging.example.test"))
+        self.assertTrue(render_staging_scope_is_https("https", False, "https://staging.example.test"))
 
 
 if __name__ == "__main__":
