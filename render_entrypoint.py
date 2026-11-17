@@ -4,6 +4,8 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import socket
+import ssl
 import sys
 from urllib.parse import urlsplit
 
@@ -23,11 +25,17 @@ class DeploymentConfigError(RuntimeError):
 
 
 class StagingInitializationError(RuntimeError):
-    def __init__(self, check: str, config_key: str, reason: str, error_class: str | None = None):
+    def __init__(self, check: str, config_key: str, reason: str, error_class: str | None = None,
+            *, operation_phase: str | None = None, failure_category: str | None = None,
+            sqlstate: str | None = None, mismatch_fields: tuple[str, ...] = ()):
         self.check = check
         self.config_key = config_key
         self.reason = reason
         self.error_class = error_class
+        self.operation_phase = operation_phase
+        self.failure_category = failure_category
+        self.sqlstate = sqlstate
+        self.mismatch_fields = mismatch_fields
         super().__init__(reason)
 
 
@@ -198,6 +206,76 @@ def _is_private_render_address(value: object) -> bool:
         and not address.is_multicast and not address.is_unspecified and not address.is_reserved)
 
 
+_SQLSTATE_RE = re.compile(r"^[0-9A-Z]{5}$")
+
+
+def _safe_sqlstate(exc: BaseException) -> str | None:
+    state = getattr(exc, "sqlstate", None)
+    if not isinstance(state, str):
+        state = getattr(getattr(exc, "diag", None), "sqlstate", None)
+    return state if isinstance(state, str) and _SQLSTATE_RE.fullmatch(state) else None
+
+
+def _exception_chain(exc: BaseException):
+    seen = set()
+    current: BaseException | None = exc
+    for _ in range(6):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _safe_connection_failure_category(exc: BaseException) -> str:
+    """Classify known libpq/socket errors without returning their text."""
+    chain = tuple(_exception_chain(exc))
+    sqlstate = _safe_sqlstate(exc)
+    if sqlstate and sqlstate.startswith("28"):
+        return "authentication"
+    if any(isinstance(item, (TimeoutError, socket.timeout)) for item in chain):
+        return "timeout"
+    if any(isinstance(item, socket.gaierror) for item in chain):
+        return "dns"
+    if any(isinstance(item, ssl.SSLError) for item in chain):
+        return "tls"
+    safe_text = " ".join(str(item).lower() for item in chain)
+    if any(token in safe_text for token in (
+            "could not translate host name", "name or service not known", "nodename nor servname",
+            "temporary failure in name resolution", "getaddrinfo failed", "no address associated with hostname")):
+        return "dns"
+    if any(token in safe_text for token in (
+            "password authentication failed", "authentication failed", "no password supplied",
+            "role does not exist", "does not exist as a role")):
+        return "authentication"
+    if any(token in safe_text for token in (
+            "certificate verify failed", "ssl error", "ssl syscall", "tls handshake", "server does not support ssl")):
+        return "tls"
+    if any(token in safe_text for token in ("connection timeout", "timed out", "timeout expired")):
+        return "timeout"
+    if any(token in safe_text for token in (
+            "connection refused", "network is unreachable", "no route to host", "connection reset",
+            "host is unreachable", "could not connect to server")):
+        return "tcp"
+    if sqlstate:
+        return "postgres_error"
+    return "connection"
+
+
+def _safe_error_class(exc: BaseException) -> str:
+    name = type(exc).__name__
+    return name if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", name) else "ProviderError"
+
+
+def _log_database_diagnostic(*, phase: str, category: str, error_class: str | None = None,
+        sqlstate: str | None = None, mismatch_fields: tuple[str, ...] = ()) -> None:
+    fields = "".join(f" field_{index}={name}" for index, name in enumerate(mismatch_fields, 1))
+    cls = f" error_class={error_class}" if error_class else ""
+    state = f" sqlstate={sqlstate}" if sqlstate else ""
+    print(f"render_startup diagnostic=database phase={phase} category={category}{cls}{state}{fields}",
+        file=sys.stderr, flush=True)
+
+
 def verify_render_database_identity(values: dict[str, str] | None = None) -> None:
     """Authenticate and verify the exact private Render staging PostgreSQL target."""
     env = os.environ if values is None else values
@@ -205,42 +283,56 @@ def verify_render_database_identity(values: dict[str, str] | None = None) -> Non
     expected_host = env.get("GENESIS_RENDER_DATABASE_HOST", "").strip()
     expected_database = env.get("GENESIS_RENDER_DATABASE_NAME", "").strip()
     expected_user = env.get("GENESIS_RENDER_DATABASE_USER", "").strip()
+    phase = "url_validation"
     try:
         db_backend.validate_render_internal_staging_postgres_url(dsn, staging_enabled=env.get("GENESIS_RENDER_STAGING") == "1",
             expected_host=expected_host, expected_database=expected_database, expected_user=expected_user)
+        phase = "driver_import"
         import psycopg
+        phase = "connection"
         with psycopg.connect(db_backend.postgres_connect_info(dsn), connect_timeout=8, autocommit=True) as conn:
             client = conn.info
+            phase = "identity_query"
             with conn.cursor() as cursor:
                 cursor.execute("""SELECT current_database(), current_user, inet_server_addr()::text,
                     inet_server_port(), current_setting('server_version_num'), current_setting('server_encoding'),
                     (SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid())""")
                 row = cursor.fetchone()
+        phase = "identity_comparison"
         client_address = str(client.hostaddr or "").split("/", 1)[0]
         server_address = str(row[2] or "").split("/", 1)[0]
         version_num = int(row[4])
-        valid = (
-            str(client.host or "").lower() == expected_host.lower()
-            and str(client.port or "") == "5432"
-            and str(client.dbname or "") == expected_database
-            and str(client.user or "") == expected_user
-            and str(row[0]) == expected_database
-            and str(row[1]) == expected_user
-            and str(row[3]) == "5432"
-            and version_num // 10_000 == 18
-            and str(row[5]).upper() == "UTF8"
-            and row[6] is True
-            and _is_private_render_address(client_address)
-            and _is_private_render_address(server_address)
+        checks = (
+            ("client_host", str(client.host or "").lower() == expected_host.lower()),
+            ("client_port", str(client.port or "") == "5432"),
+            ("client_database", str(client.dbname or "") == expected_database),
+            ("client_user", str(client.user or "") == expected_user),
+            ("server_database", str(row[0]) == expected_database),
+            ("server_user", str(row[1]) == expected_user),
+            ("server_port", str(row[3]) == "5432"),
+            ("server_version", version_num // 10_000 == 18),
+            ("server_encoding", str(row[5]).upper() == "UTF8"),
+            ("tls_active", row[6] is True),
+            ("client_address_private", _is_private_render_address(client_address)),
+            ("server_address_private", _is_private_render_address(server_address)),
         )
-        if not valid:
+        mismatches = tuple(name for name, valid in checks if not valid)
+        if mismatches:
+            _log_database_diagnostic(phase=phase, category="identity_mismatch", mismatch_fields=mismatches)
             raise StagingInitializationError("database_identity", "GENESIS_DATABASE_URL",
-                "Connected PostgreSQL identity, TLS state, or server properties do not match the approved Render staging target.")
+                "Connected PostgreSQL identity, TLS state, or server properties do not match the approved Render staging target.",
+                operation_phase=phase, failure_category="identity_mismatch", mismatch_fields=mismatches)
     except StagingInitializationError:
         raise
     except Exception as exc:
+        category = _safe_connection_failure_category(exc) if phase in {"connection", "identity_query"} else (
+            "driver_unavailable" if phase == "driver_import" else "configuration")
+        error_class = _safe_error_class(exc)
+        sqlstate = _safe_sqlstate(exc)
+        _log_database_diagnostic(phase=phase, category=category, error_class=error_class, sqlstate=sqlstate)
         raise StagingInitializationError("database_identity", "GENESIS_DATABASE_URL",
-            "Could not verify the authorized Render staging PostgreSQL identity.", type(exc).__name__) from None
+            "Could not verify the authorized Render staging PostgreSQL identity.", error_class,
+            operation_phase=phase, failure_category=category, sqlstate=sqlstate) from None
 
 
 def initialize_staging_database(values: dict[str, str] | None = None, *, identity_check=None,

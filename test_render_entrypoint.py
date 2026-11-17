@@ -1,9 +1,11 @@
 """Offline regression checks for the Render startup configuration gate."""
 from __future__ import annotations
 
+import io
 import tempfile
 import sys
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -162,22 +164,89 @@ class RenderEntrypointTests(unittest.TestCase):
                 with self.subTest(identity_field=index):
                     prior = result[index]
                     result[index] = bad_value
-                    with self.assertRaises(StagingInitializationError):
+                    with self.assertRaises(StagingInitializationError) as caught:
                         verify_render_database_identity(env)
+                    expected_fields = ("server_database", "server_user", "server_address_private",
+                        "server_port", "server_version", "server_encoding", "tls_active")
+                    self.assertIn(expected_fields[index], caught.exception.mismatch_fields)
                     result[index] = prior
             for field, bad_value in (("host", "other.internal"), ("port", "55432"),
                     ("dbname", "other_db"), ("user", "other_user")):
                 with self.subTest(client_metadata=field):
                     prior = getattr(info, field)
                     setattr(info, field, bad_value)
-                    with self.assertRaises(StagingInitializationError):
+                    with self.assertRaises(StagingInitializationError) as caught:
                         verify_render_database_identity(env)
+                    self.assertIn({"host":"client_host", "port":"client_port",
+                        "dbname":"client_database", "user":"client_user"}[field],
+                        caught.exception.mismatch_fields)
                     setattr(info, field, prior)
             prior_hostaddr = info.hostaddr
             info.hostaddr = "8.8.8.8"
             with self.assertRaises(StagingInitializationError):
                 verify_render_database_identity(env)
             info.hostaddr = prior_hostaddr
+
+    def test_database_connection_failures_have_sanitized_phase_categories(self):
+        env = dict(self.environment)
+
+        class OperationalError(Exception):
+            pass
+
+        cases = (
+            ("dns", OperationalError("could not translate host name 'private-db-name'"), None),
+            ("tcp", OperationalError("connection refused at 10.23.4.5:5432"), None),
+            ("tls", OperationalError("SSL error for certificate /private/cert.pem"), None),
+            ("authentication", OperationalError("password authentication failed for user private-user"), "28P01"),
+            ("timeout", TimeoutError("connection timed out to private-db-name"), None),
+            ("connection", OperationalError("unclassified provider failure"), None),
+        )
+        for category, error, sqlstate in cases:
+            if sqlstate:
+                error.sqlstate = sqlstate
+            diagnostics = io.StringIO()
+            fake_driver = SimpleNamespace(connect=lambda *_args, _error=error, **_kwargs: (_ for _ in ()).throw(_error))
+            with self.subTest(category=category), patch.dict(sys.modules, {"psycopg": fake_driver}), \
+                    redirect_stderr(diagnostics):
+                with self.assertRaises(StagingInitializationError) as caught:
+                    verify_render_database_identity(env)
+            self.assertEqual(caught.exception.operation_phase, "connection")
+            self.assertEqual(caught.exception.failure_category, category)
+            self.assertEqual(caught.exception.error_class, type(error).__name__)
+            self.assertEqual(caught.exception.sqlstate, sqlstate)
+            log = diagnostics.getvalue()
+            self.assertIn(f"phase=connection category={category}", log)
+            for sensitive in ("private-db-name", "10.23.4.5", "/private/cert.pem", "private-user"):
+                self.assertNotIn(sensitive, log)
+
+    def test_identity_query_failure_reports_safe_sqlstate_and_phase(self):
+        env = dict(self.environment)
+
+        class QueryError(Exception):
+            sqlstate = "42501"
+
+        class FakeCursor:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def execute(self, _query): raise QueryError("permission denied for private relation")
+
+        class FakeConnection:
+            info = SimpleNamespace(host="db.internal", port="5432", dbname="marina_staging",
+                user="marina_staging", hostaddr="10.20.1.8")
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def cursor(self): return FakeCursor()
+
+        fake_driver = SimpleNamespace(connect=lambda *_args, **_kwargs: FakeConnection())
+        diagnostics = io.StringIO()
+        with patch.dict(sys.modules, {"psycopg": fake_driver}), redirect_stderr(diagnostics):
+            with self.assertRaises(StagingInitializationError) as caught:
+                verify_render_database_identity(env)
+        self.assertEqual(caught.exception.operation_phase, "identity_query")
+        self.assertEqual(caught.exception.failure_category, "postgres_error")
+        self.assertEqual(caught.exception.sqlstate, "42501")
+        self.assertIn("phase=identity_query category=postgres_error", diagnostics.getvalue())
+        self.assertNotIn("private relation", diagnostics.getvalue())
 
     def test_fresh_database_initialization_is_explicit_scoped_and_idempotent(self):
         env = dict(self.environment)
