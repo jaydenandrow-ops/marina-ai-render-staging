@@ -291,7 +291,14 @@ def verify_render_database_identity(values: dict[str, str] | None = None) -> Non
         import psycopg
         phase = "connection"
         with psycopg.connect(db_backend.postgres_connect_info(dsn), connect_timeout=8, autocommit=True) as conn:
-            client = conn.info
+            # ConnectionInfo is backed by libpq's PGconn and must be snapshotted
+            # before this context exits and closes the underlying connection.
+            phase = "client_metadata"
+            client_host = conn.info.host
+            client_hostaddr = conn.info.hostaddr
+            client_port = conn.info.port
+            client_database = conn.info.dbname
+            client_user = conn.info.user
             phase = "identity_query"
             with conn.cursor() as cursor:
                 cursor.execute("""SELECT current_database(), current_user, inet_server_addr()::text,
@@ -299,14 +306,14 @@ def verify_render_database_identity(values: dict[str, str] | None = None) -> Non
                     (SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid())""")
                 row = cursor.fetchone()
         phase = "identity_comparison"
-        client_address = str(client.hostaddr or "").split("/", 1)[0]
+        client_address = str(client_hostaddr or "").split("/", 1)[0]
         server_address = str(row[2] or "").split("/", 1)[0]
         version_num = int(row[4])
         checks = (
-            ("client_host", str(client.host or "").lower() == expected_host.lower()),
-            ("client_port", str(client.port or "") == "5432"),
-            ("client_database", str(client.dbname or "") == expected_database),
-            ("client_user", str(client.user or "") == expected_user),
+            ("client_host", str(client_host or "").lower() == expected_host.lower()),
+            ("client_port", str(client_port or "") == "5432"),
+            ("client_database", str(client_database or "") == expected_database),
+            ("client_user", str(client_user or "") == expected_user),
             ("server_database", str(row[0]) == expected_database),
             ("server_user", str(row[1]) == expected_user),
             ("server_port", str(row[3]) == "5432"),
@@ -325,7 +332,8 @@ def verify_render_database_identity(values: dict[str, str] | None = None) -> Non
     except StagingInitializationError:
         raise
     except Exception as exc:
-        category = _safe_connection_failure_category(exc) if phase in {"connection", "identity_query"} else (
+        category = _safe_connection_failure_category(exc) if phase in {
+            "connection", "client_metadata", "identity_query"} else (
             "driver_unavailable" if phase == "driver_import" else "configuration")
         error_class = _safe_error_class(exc)
         sqlstate = _safe_sqlstate(exc)

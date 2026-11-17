@@ -187,6 +187,45 @@ class RenderEntrypointTests(unittest.TestCase):
                 verify_render_database_identity(env)
             info.hostaddr = prior_hostaddr
 
+    def test_connection_info_is_snapshotted_before_psycopg_connection_closes(self):
+        env = dict(self.environment)
+
+        class OperationalError(Exception):
+            pass
+
+        class GuardedConnectionInfo:
+            _values = {"host":"db.internal", "hostaddr":"10.20.1.8", "port":5432,
+                "dbname":"marina_staging", "user":"marina_staging"}
+
+            def __init__(self):
+                self.connection_open = True
+
+            def __getattr__(self, name):
+                if not self.connection_open:
+                    raise OperationalError("the connection is closed")
+                return self._values[name]
+
+        info = GuardedConnectionInfo()
+
+        class FakeCursor:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def execute(self, _query): return None
+            def fetchone(self):
+                return ("marina_staging", "marina_staging", "10.20.1.9", 5432, "180006", "UTF8", True)
+
+        class FakeConnection:
+            def __init__(self): self.info = info
+            def __enter__(self): return self
+            def __exit__(self, *_):
+                info.connection_open = False
+                return False
+            def cursor(self): return FakeCursor()
+
+        fake_driver = SimpleNamespace(connect=lambda *_args, **_kwargs: FakeConnection())
+        with patch.dict(sys.modules, {"psycopg": fake_driver}):
+            verify_render_database_identity(env)
+
     def test_database_connection_failures_have_sanitized_phase_categories(self):
         env = dict(self.environment)
 
