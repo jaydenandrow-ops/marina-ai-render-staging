@@ -3,9 +3,10 @@
 # Free Postgres is disposable: it expires after 30 days and has no backups.
 services:
   - type: web
-    name: marina-ai-synthetic-staging
+    name: marina-ai-render-staging
     runtime: docker
     plan: free
+    region: ohio
     dockerfilePath: ./Dockerfile
     dockerContext: .
     autoDeploy: false
@@ -15,10 +16,18 @@ services:
         value: production
       - key: GENESIS_BIND_HOST
         value: 0.0.0.0
+      - key: GENESIS_RENDER_STAGING
+        value: "1"
       - key: GENESIS_DATABASE_URL
         sync: false
-      - key: PGSSLROOTCERT
-        value: /etc/secrets/render-postgres-ca.pem
+      - key: GENESIS_RENDER_DATABASE_HOST
+        sync: false
+      - key: GENESIS_RENDER_DATABASE_NAME
+        value: marina_staging
+      - key: GENESIS_RENDER_DATABASE_USER
+        sync: false
+      - key: MARINA_STAGING_INITIALIZE_ON_START
+        value: "0"
       - key: GENESIS_ALLOWED_HOSTS
         sync: false
       - key: GENESIS_CANONICAL_ORIGIN
@@ -52,9 +61,5 @@ services:
       - key: RETENTION_STORAGE_CLEANUP_ENABLED
         value: "0"
 
-databases:
-  - name: marina-ai-synthetic-staging-db
-    plan: free
-    databaseName: marina_staging
-    user: marina_staging
-    postgresMajorVersion: "18"
+# The existing marina-staging-db Render PostgreSQL service is configured through
+# the web service's internal URL. This Blueprint does not create another database.

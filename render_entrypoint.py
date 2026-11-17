@@ -5,8 +5,11 @@ import ipaddress
 import os
 import re
 import sys
-from pathlib import Path
 from urllib.parse import urlsplit
+
+import database_backend as db_backend
+
+STAGING_INITIALIZATION_CONFIRMATION = "INITIALIZE_EMPTY_MARINA_STAGING_DB"
 
 
 class DeploymentConfigError(RuntimeError):
@@ -16,6 +19,15 @@ class DeploymentConfigError(RuntimeError):
         self.check = check
         self.config_key = config_key
         self.reason = reason
+        super().__init__(reason)
+
+
+class StagingInitializationError(RuntimeError):
+    def __init__(self, check: str, config_key: str, reason: str, error_class: str | None = None):
+        self.check = check
+        self.config_key = config_key
+        self.reason = reason
+        self.error_class = error_class
         super().__init__(reason)
 
 
@@ -44,28 +56,70 @@ def validate_runtime_environment(env: dict[str, str] | None = None, *, announce:
         raise DeploymentConfigError("assigned_port", "PORT", "Render PORT is outside the supported range.")
     passed("assigned_port")
 
+    if values.get("GENESIS_RENDER_STAGING") != "1":
+        raise DeploymentConfigError("render_staging_scope", "GENESIS_RENDER_STAGING",
+            "GENESIS_RENDER_STAGING must explicitly be 1 for this deployment bundle.")
+    passed("render_staging_scope")
+
+    expected_host = values.get("GENESIS_RENDER_DATABASE_HOST", "").strip()
+    expected_database = values.get("GENESIS_RENDER_DATABASE_NAME", "").strip()
+    expected_user = values.get("GENESIS_RENDER_DATABASE_USER", "").strip()
+    host_labels = expected_host.lower().split(".")
+    valid_host = (len(expected_host) <= 253 and bool(expected_host)
+        and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in host_labels))
+    try:
+        ipaddress.ip_address(expected_host)
+        valid_host = False
+    except ValueError:
+        pass
+    if not valid_host:
+        raise DeploymentConfigError("database_target", "GENESIS_RENDER_DATABASE_HOST",
+            "Expected Render internal database hostname must be explicitly configured.")
+    if expected_database != "marina_staging":
+        raise DeploymentConfigError("database_target", "GENESIS_RENDER_DATABASE_NAME",
+            "Render staging database name must match the approved synthetic database.")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,63}", expected_user):
+        raise DeploymentConfigError("database_target", "GENESIS_RENDER_DATABASE_USER",
+            "Render staging database user must be explicitly configured from the approved database identity.")
+    passed("database_target")
+
     database_url = values.get("GENESIS_DATABASE_URL", "").strip()
-    from database_backend import is_postgres_url, validate_production_postgres_url
-    if not is_postgres_url(database_url):
+    if not db_backend.is_postgres_url(database_url):
         raise DeploymentConfigError("database_backend", "GENESIS_DATABASE_URL",
             "GENESIS_DATABASE_URL must be a PostgreSQL URL; SQLite fallback is forbidden.")
     passed("database_backend")
     try:
-        validate_production_postgres_url(database_url)
-    except RuntimeError:
-        raise DeploymentConfigError("database_tls_mode", "GENESIS_DATABASE_URL",
-            "PostgreSQL URL must use sslmode=verify-full.") from None
-    passed("database_tls_mode")
-    ca_value = values.get("PGSSLROOTCERT", "")
+        db_backend.validate_render_internal_staging_postgres_url(database_url, staging_enabled=True,
+            expected_host=expected_host, expected_database=expected_database, expected_user=expected_user)
+    except RuntimeError as exc:
+        target_key = str(exc)
+        if target_key not in {"GENESIS_RENDER_DATABASE_HOST", "GENESIS_RENDER_DATABASE_NAME",
+                "GENESIS_RENDER_DATABASE_USER", "GENESIS_DATABASE_URL"}:
+            target_key = "GENESIS_DATABASE_URL"
+        check = "database_tls_mode" if target_key == "GENESIS_DATABASE_URL" else "database_target"
+        raise DeploymentConfigError(check, target_key,
+            "Render internal PostgreSQL URL must match the configured staging identity and TLS policy.") from None
     try:
-        ca_path = Path(ca_value)
-        ca_exists = bool(ca_value) and ca_path.is_file()
-    except (OSError, ValueError):
-        ca_exists = False
-    if not ca_exists:
-        raise DeploymentConfigError("database_ca_file", "PGSSLROOTCERT",
-            "PGSSLROOTCERT must point to the mounted Render PostgreSQL CA file.")
-    passed("database_ca_file")
+        db_backend.validate_render_staging_libpq_environment(values)
+    except RuntimeError as exc:
+        name = str(exc)
+        config_key = name if name in db_backend.RENDER_STAGING_FORBIDDEN_LIBPQ_ENV else "GENESIS_DATABASE_URL"
+        raise DeploymentConfigError("database_libpq_overrides", config_key,
+            f"{config_key} must be unset for the explicit Render staging connection.") from None
+    passed("database_tls_mode")
+
+    init_flag = values.get("MARINA_STAGING_INITIALIZE_ON_START", "0").strip()
+    init_confirmation = values.get("MARINA_STAGING_INITIALIZATION_CONFIRMATION", "")
+    if init_flag not in {"0", "1"}:
+        raise DeploymentConfigError("staging_initialization_flag", "MARINA_STAGING_INITIALIZE_ON_START",
+            "MARINA_STAGING_INITIALIZE_ON_START must be 0 or 1.")
+    if init_flag == "1" and init_confirmation != STAGING_INITIALIZATION_CONFIRMATION:
+        raise DeploymentConfigError("staging_initialization_authorization", "MARINA_STAGING_INITIALIZATION_CONFIRMATION",
+            "Explicit staging initialization confirmation is required.")
+    if init_flag == "0" and init_confirmation:
+        raise DeploymentConfigError("staging_initialization_authorization", "MARINA_STAGING_INITIALIZATION_CONFIRMATION",
+            "Remove the initialization confirmation when staging initialization is disabled.")
+    passed("staging_initialization_authorization")
 
     for name in ("GENESIS_ALLOWED_HOSTS", "GENESIS_CANONICAL_ORIGIN", "GENESIS_CORS_ALLOWED_ORIGINS",
                  "GENESIS_TRUSTED_PROXY_CIDRS"):
@@ -138,6 +192,113 @@ def validate_runtime_environment(env: dict[str, str] | None = None, *, announce:
     return port
 
 
+def _is_private_render_address(value: object) -> bool:
+    try:
+        address = ipaddress.ip_address(str(value).split("/", 1)[0])
+    except ValueError:
+        return False
+    return (address.is_private and not address.is_loopback and not address.is_link_local
+        and not address.is_multicast and not address.is_unspecified and not address.is_reserved)
+
+
+def verify_render_database_identity(values: dict[str, str] | None = None) -> None:
+    """Authenticate and verify the exact private Render staging PostgreSQL target."""
+    env = os.environ if values is None else values
+    dsn = env.get("GENESIS_DATABASE_URL", "").strip()
+    expected_host = env.get("GENESIS_RENDER_DATABASE_HOST", "").strip()
+    expected_database = env.get("GENESIS_RENDER_DATABASE_NAME", "").strip()
+    expected_user = env.get("GENESIS_RENDER_DATABASE_USER", "").strip()
+    try:
+        db_backend.validate_render_internal_staging_postgres_url(dsn, staging_enabled=env.get("GENESIS_RENDER_STAGING") == "1",
+            expected_host=expected_host, expected_database=expected_database, expected_user=expected_user)
+        import psycopg
+        with psycopg.connect(db_backend.postgres_connect_info(dsn), connect_timeout=8, autocommit=True) as conn:
+            client = conn.info
+            with conn.cursor() as cursor:
+                cursor.execute("""SELECT current_database(), current_user, inet_server_addr()::text,
+                    inet_server_port(), current_setting('server_version_num'), current_setting('server_encoding'),
+                    (SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid())""")
+                row = cursor.fetchone()
+        client_address = str(client.hostaddr or "").split("/", 1)[0]
+        server_address = str(row[2] or "").split("/", 1)[0]
+        version_num = int(row[4])
+        valid = (
+            str(client.host or "").lower() == expected_host.lower()
+            and str(client.port or "") == "5432"
+            and str(client.dbname or "") == expected_database
+            and str(client.user or "") == expected_user
+            and str(row[0]) == expected_database
+            and str(row[1]) == expected_user
+            and str(row[3]) == "5432"
+            and version_num // 10_000 == 18
+            and str(row[5]).upper() == "UTF8"
+            and row[6] is True
+            and _is_private_render_address(client_address)
+            and _is_private_render_address(server_address)
+        )
+        if not valid:
+            raise StagingInitializationError("database_identity", "GENESIS_DATABASE_URL",
+                "Connected PostgreSQL identity, TLS state, or server properties do not match the approved Render staging target.")
+    except StagingInitializationError:
+        raise
+    except Exception as exc:
+        raise StagingInitializationError("database_identity", "GENESIS_DATABASE_URL",
+            "Could not verify the authorized Render staging PostgreSQL identity.", type(exc).__name__) from None
+
+
+def initialize_staging_database(values: dict[str, str] | None = None, *, identity_check=None,
+        inspect_state=None, migrate=None, verify_ready=None, announce: bool = False) -> str:
+    """Explicitly initialize only an empty Render staging schema, never import/reset data."""
+    env = os.environ if values is None else values
+    if env.get("MARINA_STAGING_INITIALIZE_ON_START", "0").strip() != "1":
+        return "disabled"
+    if env.get("GENESIS_RENDER_STAGING") != "1" or env.get("GENESIS_ENV") != "production":
+        raise StagingInitializationError("staging_initialization_scope", "GENESIS_RENDER_STAGING",
+            "Fresh schema initialization is limited to explicitly enabled Render staging.")
+    if env.get("MARINA_STAGING_INITIALIZATION_CONFIRMATION") != STAGING_INITIALIZATION_CONFIRMATION:
+        raise StagingInitializationError("staging_initialization_authorization",
+            "MARINA_STAGING_INITIALIZATION_CONFIRMATION", "Explicit staging initialization confirmation is required.")
+    if identity_check is None:
+        identity_check = verify_render_database_identity
+    if inspect_state is None:
+        from migrations.postgres import inspect_migration_state
+        inspect_state = inspect_migration_state
+    if migrate is None:
+        from migrations.postgres import migrate_fresh
+        migrate = migrate_fresh
+    if verify_ready is None:
+        from migrations.postgres import verify_ready as verify_postgres_ready
+        verify_ready = verify_postgres_ready
+
+    try:
+        identity_check(env)
+        if announce:
+            print("render_startup check=database_identity status=pass target=verified", flush=True)
+        state = inspect_state()
+        schema_state = state.get("schema_state")
+        if schema_state == "empty_fresh":
+            if announce:
+                print("render_startup check=fresh_schema status=starting", flush=True)
+            migrate()
+            verify_ready()
+            if announce:
+                print("render_startup check=fresh_schema status=pass result=initialized", flush=True)
+            return "initialized"
+        if schema_state == "verified_current":
+            verify_ready()
+            if announce:
+                print("render_startup check=fresh_schema status=pass result=already_current", flush=True)
+            return "already_current"
+        raise StagingInitializationError("fresh_schema", "MARINA_STAGING_INITIALIZE_ON_START",
+            "Database is not empty and current; initialization refused without changing it.")
+    except StagingInitializationError:
+        raise
+    except Exception as exc:
+        raise StagingInitializationError("database_migration", "MARINA_STAGING_INITIALIZE_ON_START",
+            "Staging schema initialization or readiness verification failed; application startup stopped.",
+            type(exc).__name__) from None
+
+
 def main() -> None:
     try:
         port = validate_runtime_environment(announce=True)
@@ -145,6 +306,23 @@ def main() -> None:
         print(f"render_startup check={exc.check} status=fail config_key={exc.config_key} reason={exc.reason}",
             file=sys.stderr, flush=True)
         raise SystemExit(2) from None
+    try:
+        init_result = initialize_staging_database(announce=True)
+        if init_result == "disabled":
+            try:
+                verify_render_database_identity()
+                print("render_startup check=database_identity status=pass target=verified", flush=True)
+            except StagingInitializationError as exc:
+                suffix = f" error_class={exc.error_class}" if exc.error_class else ""
+                print(f"render_startup check={exc.check} status=fail config_key={exc.config_key} reason={exc.reason}{suffix}",
+                    file=sys.stderr, flush=True)
+                raise SystemExit(3) from None
+            print("render_startup check=fresh_schema status=skipped authorization=disabled", flush=True)
+    except StagingInitializationError as exc:
+        suffix = f" error_class={exc.error_class}" if exc.error_class else ""
+        print(f"render_startup check={exc.check} status=fail config_key={exc.config_key} reason={exc.reason}{suffix}",
+            file=sys.stderr, flush=True)
+        raise SystemExit(3) from None
     print("render_startup check=application_handoff status=starting server=uvicorn", flush=True)
     try:
         os.execv(sys.executable, [sys.executable, "-m", "uvicorn", "staging_app:app",

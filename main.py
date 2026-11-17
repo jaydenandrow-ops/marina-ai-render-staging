@@ -31,7 +31,8 @@ from migrations import MigrationError, dry_run as inspect_migration_database, mi
 from migrations.versions import CLOUD_BUDGET_MIGRATIONS
 from database_safety import validate_test_database_configuration, validate_test_database_path
 from database_backend import (checkout_postgres, close_postgres_pool, database_url, is_postgres_url,
-    postgres_connection, validate_production_postgres_url, validate_test_postgres_url)
+    postgres_connection, validate_production_postgres_url, validate_render_internal_staging_postgres_url,
+    validate_render_staging_libpq_environment, validate_test_postgres_url)
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("GENESIS_DB_PATH", str(ROOT / "genesis.db")))
@@ -79,8 +80,20 @@ elif GENESIS_ENV == "test":
 if DATABASE_BACKEND == "postgresql" and (os.getenv("CLOUD_BUDGET_DB_PATH", "").strip()
         or os.getenv("CLOUD_BUDGET_DATABASE_URL", "").strip()):
     raise RuntimeError("PostgreSQL currently requires app and cloud-budget tables in the same database.")
+_render_staging_mode = os.getenv("GENESIS_RENDER_STAGING", "0").strip()
+if _render_staging_mode not in {"0", "1"}:
+    raise RuntimeError("GENESIS_RENDER_STAGING must be 0 or 1.")
+if _render_staging_mode == "1" and (GENESIS_ENV != "production" or DATABASE_BACKEND != "postgresql"):
+    raise RuntimeError("Render internal PostgreSQL policy is limited to production-mode PostgreSQL staging.")
 if GENESIS_ENV == "production" and DATABASE_BACKEND == "postgresql":
-    validate_production_postgres_url(GENESIS_DATABASE_URL)
+    if _render_staging_mode == "1":
+        validate_render_staging_libpq_environment()
+        validate_render_internal_staging_postgres_url(GENESIS_DATABASE_URL, staging_enabled=True,
+            expected_host=os.getenv("GENESIS_RENDER_DATABASE_HOST", ""),
+            expected_database=os.getenv("GENESIS_RENDER_DATABASE_NAME", ""),
+            expected_user=os.getenv("GENESIS_RENDER_DATABASE_USER", ""))
+    else:
+        validate_production_postgres_url(GENESIS_DATABASE_URL)
 GENESIS_BIND_HOST = os.getenv("GENESIS_BIND_HOST", "127.0.0.1").strip().lower()
 _bind_is_loopback = validate_bind_configuration(GENESIS_ENV, GENESIS_BIND_HOST,
     explicitly_configured=bool(os.getenv("GENESIS_BIND_HOST", "").strip()))
@@ -533,8 +546,8 @@ def verify_production_database_ready(path: str | Path | None = None) -> dict:
         try:
             from migrations.postgres import verify_ready
             return verify_ready()
-        except Exception as exc:
-            raise RuntimeError("Production startup refused: PostgreSQL schema is not ready.") from exc
+        except Exception:
+            raise RuntimeError("Production startup refused: PostgreSQL schema is not ready.") from None
     target = Path(path) if path is not None else DB_PATH
     try:
         status = inspect_migration_database(target)

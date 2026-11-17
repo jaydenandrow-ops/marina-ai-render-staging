@@ -15,6 +15,10 @@ from typing import Iterator
 from urllib.parse import parse_qs, unquote, urlsplit
 
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://", "postgresql+psycopg://")
+RENDER_STAGING_FORBIDDEN_LIBPQ_ENV = (
+    "PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGSERVICE", "PGSERVICEFILE",
+    "PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY",
+)
 _IMMEDIATE_LOCK_KEY = 5_377_749_112_829_171_023
 _POOL_LOCK = threading.Lock()
 
@@ -65,6 +69,51 @@ def validate_production_postgres_url(value: str) -> None:
         raise RuntimeError("Production PostgreSQL URL must include a host and database name.")
     if sslmode != "verify-full":
         raise RuntimeError("Production PostgreSQL URL must require sslmode=verify-full.")
+
+
+def validate_render_internal_staging_postgres_url(value: str, *, staging_enabled: bool,
+        expected_host: str, expected_database: str, expected_user: str) -> None:
+    """Allow TLS-only Render internal URLs solely for the explicit staging build.
+
+    Render's internal PostgreSQL certificates are self-signed, so libpq cannot
+    verify their CA/hostname. sslmode=require still requires encryption and
+    prevents plaintext fallback. Other environments must keep using the strict
+    verify-full validator above.
+    """
+    if not staging_enabled:
+        raise RuntimeError("Render internal PostgreSQL policy is staging-only.")
+    try:
+        parsed = urlsplit(postgres_connect_info(value))
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        ssl_modes = query.get("sslmode", [])
+        database = unquote(parsed.path.lstrip("/"))
+        username = unquote(parsed.username or "")
+        port = parsed.port or 5432
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("Render internal PostgreSQL URL is invalid.") from exc
+    if (not expected_host.strip() or expected_database != "marina_staging"
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,63}", expected_user)):
+        raise RuntimeError("Render staging database identity configuration is incomplete or unsupported.")
+    if not parsed.hostname or parsed.hostname.lower() != expected_host.strip().lower():
+        raise RuntimeError("GENESIS_RENDER_DATABASE_HOST")
+    if database != expected_database:
+        raise RuntimeError("GENESIS_RENDER_DATABASE_NAME")
+    if username != expected_user:
+        raise RuntimeError("GENESIS_RENDER_DATABASE_USER")
+    if port != 5432:
+        raise RuntimeError("GENESIS_DATABASE_URL")
+    if ssl_modes != ["require"]:
+        raise RuntimeError("GENESIS_DATABASE_URL")
+    if any(key.lower() == "sslrootcert" for key in query):
+        raise RuntimeError("GENESIS_DATABASE_URL")
+
+
+def validate_render_staging_libpq_environment(values: dict[str, str] | None = None) -> None:
+    """Reject libpq environment overrides that could supersede the reviewed URL."""
+    source = os.environ if values is None else values
+    for name in RENDER_STAGING_FORBIDDEN_LIBPQ_ENV:
+        if source.get(name, "").strip():
+            raise RuntimeError(name)
 
 
 def qmark_to_pyformat(sql: str) -> str:
