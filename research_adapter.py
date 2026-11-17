@@ -16,7 +16,9 @@ from pathlib import Path
 
 from resources import memory_status
 
-DEFAULT_RESEARCH_ROOT = Path(r"C:\Users\Windows 10\Downloads\zero_genesis_ai_v0_2\zero_genesis_ai_v0_2")
+# Research is disabled in the staging deployment. This non-existent default
+# prevents a developer machine path from entering the published bundle.
+DEFAULT_RESEARCH_ROOT = Path("/opt/marina/disabled-research")
 MAX_SECONDS = 25
 MAX_PROCESS_MEMORY = 384 * 1024 * 1024
 MIN_FREE_MEMORY = 500 * 1024 * 1024

@@ -1,4 +1,4 @@
-# MARINA AI — Render Free synthetic staging package
+﻿# MARINA AI — Render Free synthetic staging package
 
 This repository is a curated deployment copy. It contains application source and static assets only. It excludes `.env`, SQLite databases, virtual environments, tests, reports, logs, generated images, uploads, and ZERO GENESIS research artifacts.
 
@@ -15,7 +15,7 @@ Render Free is for synthetic testing only. Free web filesystems are ephemeral. F
 
 ## Required environment variable names
 
-Configure the following names in Render. This document intentionally contains no secret values:
+Required names are listed below; Render assigns `PORT` automatically. Configure the remaining values in Render. This document intentionally contains no secret values:
 
 `GENESIS_ENV`, `GENESIS_BIND_HOST`, `PORT`, `GENESIS_DATABASE_URL`, `PGSSLROOTCERT`, `GENESIS_ALLOWED_HOSTS`, `GENESIS_CANONICAL_ORIGIN`, `GENESIS_CORS_ALLOWED_ORIGINS`, `GENESIS_TRUSTED_PROXY_CIDRS`, `CLOUD_ABUSE_HMAC_SECRET`, `SECURITY_EVENT_HMAC_SECRET`, `EMAIL_AUTH_THROTTLE_SECRET`, `STAGING_BASIC_AUTH_USERNAME`, `STAGING_BASIC_AUTH_PASSWORD`, `CLOUD_PROVIDER_ENABLED`, `IMAGE_GENERATION_ENABLED`, `IMAGE_ACCOUNT_AUTHORIZATION_ENABLED`, `GENESIS_RESEARCH_ENABLED`, `ACCOUNT_DELETION_ENABLED`, `RETENTION_CLEANUP_ENABLED`, `RETENTION_STORAGE_CLEANUP_ENABLED`.
 
@@ -35,7 +35,7 @@ Do not add `.env`, databases, generated uploads, secrets, or real user data. Git
 
 ## Render dashboard steps
 
-1. In Render, choose **New → Blueprint Instance** and connect the private GitHub repository.
+1. In Render, choose **New > Blueprint Instance** and connect the private GitHub repository.
 2. Review the Blueprint resource plan: one Free web service and one Free PostgreSQL database. No resource is created by this local package.
 3. Before applying, confirm this is a disposable synthetic database and accept the Free database’s 30-day expiry/no-backup limitation.
 4. Complete all `sync: false` fields. Set the exact actual Render hostname/origin values, verified trusted proxy CIDRs, external PostgreSQL URL with `sslmode=verify-full`, and staging Basic Auth credentials.
@@ -45,3 +45,6 @@ Do not add `.env`, databases, generated uploads, secrets, or real user data. Git
 8. Only after the staging site is reachable behind Basic Auth should the operator perform browser checks. Do not share the URL/password or enable public registration/chat.
 
 No GitHub push, Render resource creation, migration, or deployment was performed by this task.
+
+
+
