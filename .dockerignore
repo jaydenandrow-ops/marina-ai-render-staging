@@ -11,6 +11,7 @@
 __pycache__
 *.py[cod]
 tests
+test_render_entrypoint.py
 *.log
 uploads
 generated_images

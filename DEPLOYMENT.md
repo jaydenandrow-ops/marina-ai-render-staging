@@ -1,6 +1,6 @@
 ﻿# MARINA AI — Render Free synthetic staging package
 
-This repository is a curated deployment copy. It contains application source and static assets only. It excludes `.env`, SQLite databases, virtual environments, tests, reports, logs, generated images, uploads, and ZERO GENESIS research artifacts.
+This repository is a curated deployment copy. It contains application source, static assets, and a small standard-library startup-validation test. It excludes `.env`, SQLite databases, virtual environments, other test suites, reports, logs, generated images, uploads, and ZERO GENESIS research artifacts. The Docker build excludes the validation test.
 
 ## Staging safeguards
 
@@ -10,6 +10,12 @@ This repository is a curated deployment copy. It contains application source and
 - Database connections must pass the existing `sslmode=verify-full` validator and use a mounted CA file. The internal Render DB URL is not compatible with the app’s current verify-full requirement; configure the external Render DB URL and its CA bundle.
 - `GENESIS_TRUSTED_PROXY_CIDRS` must be populated with verified proxy peer CIDRs. Do not use `0.0.0.0/0` or `*`. Render does not document a fixed inbound proxy CIDR set in the material reviewed here, so this remains an operator verification gate.
 - The app remains production-startup read-only and will refuse an uninitialized database. Do not add migrations to the web start command.
+
+## Startup diagnostics
+
+The entrypoint writes one-line `render_startup` records to standard output/error. A configuration rejection includes a fixed `check` identifier, the relevant environment-variable name, and a safe reason; it never prints environment values. Checks cover environment mode, bind host, assigned port, PostgreSQL URL type and TLS mode, CA-file presence, host/origin/CORS policy, trusted proxy CIDRs, required secrets, staging Basic Auth, and disabled feature flags. A `check=application_handoff status=starting` record means configuration validation passed and Uvicorn is being started. Database connection, TLS handshake, and read-only schema readiness happen after that handoff; inspect subsequent Uvicorn/application logs for those failures.
+
+Run the committed offline launcher regressions from this directory with `python -B -m unittest test_render_entrypoint -v`.
 
 Render Free is for synthetic testing only. Free web filesystems are ephemeral. Free Postgres expires 30 days after creation and does not provide backups. There is no persistent disk on Free web services, no shell/SSH access, no one-off jobs, and pre-deploy commands are unavailable for Free services. Therefore this manifest is not suitable for production or user data.
 
