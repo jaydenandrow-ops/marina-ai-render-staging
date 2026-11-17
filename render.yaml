@@ -1,0 +1,60 @@
+# Synthetic-only staging blueprint. A Render web service has a public onrender.com
+# URL; every non-health request is protected by the staging Basic Auth wrapper.
+# Free Postgres is disposable: it expires after 30 days and has no backups.
+services:
+  - type: web
+    name: marina-ai-synthetic-staging
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: false
+    healthCheckPath: /healthz
+    envVars:
+      - key: GENESIS_ENV
+        value: production
+      - key: GENESIS_BIND_HOST
+        value: 0.0.0.0
+      - key: GENESIS_DATABASE_URL
+        sync: false
+      - key: PGSSLROOTCERT
+        value: /etc/secrets/render-postgres-ca.pem
+      - key: GENESIS_ALLOWED_HOSTS
+        sync: false
+      - key: GENESIS_CANONICAL_ORIGIN
+        sync: false
+      - key: GENESIS_CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: GENESIS_TRUSTED_PROXY_CIDRS
+        sync: false
+      - key: CLOUD_ABUSE_HMAC_SECRET
+        generateValue: true
+      - key: SECURITY_EVENT_HMAC_SECRET
+        generateValue: true
+      - key: EMAIL_AUTH_THROTTLE_SECRET
+        generateValue: true
+      - key: STAGING_BASIC_AUTH_USERNAME
+        sync: false
+      - key: STAGING_BASIC_AUTH_PASSWORD
+        sync: false
+      - key: CLOUD_PROVIDER_ENABLED
+        value: "0"
+      - key: IMAGE_GENERATION_ENABLED
+        value: "0"
+      - key: IMAGE_ACCOUNT_AUTHORIZATION_ENABLED
+        value: "0"
+      - key: GENESIS_RESEARCH_ENABLED
+        value: "0"
+      - key: ACCOUNT_DELETION_ENABLED
+        value: "0"
+      - key: RETENTION_CLEANUP_ENABLED
+        value: "0"
+      - key: RETENTION_STORAGE_CLEANUP_ENABLED
+        value: "0"
+
+databases:
+  - name: marina-ai-synthetic-staging-db
+    plan: free
+    databaseName: marina_staging
+    user: marina_staging
+    postgresMajorVersion: "18"
